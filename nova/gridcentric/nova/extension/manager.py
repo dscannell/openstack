@@ -87,6 +87,10 @@ class GridCentricManager(manager.SchedulerDependentManager):
         self.gridcentric_api = API()
         self.compute_manager = compute_manager.ComputeManager()
         self.cond = threading.Condition()
+  
+        self.outgoing_migration = {}
+        self.incoming_migration = {}
+  
         super(GridCentricManager, self).__init__(service_name="gridcentric", *args, **kwargs)
 
     def _init_vms(self):
@@ -178,13 +182,23 @@ class GridCentricManager(manager.SchedulerDependentManager):
     def _lock_migration(self, context, instance_id):
         self.cond.acquire()
         try:
-            # Grab a reference to the instance.
+            instance_ref = self.db.instance_get(context, instance_id)
+            if instance_ref['vm_state'] != vm_states.MIGRATING:
+                # We cannot lock a non migrating instance.
+                return False
+            if instance_id in self.outgoing_migration:
+                # We are in the process of migrating this instance.
+                return False
+            # Grab a reference to the instance's metadata.
             metadata = self.db.instance_metadata_get(context, instance_id)
             if 'gc:migrating' in metadata:
-                # This instance is already locked for migration
+                # This instance is already locked for migration. It's possible we are
+                # the destination host and a new migration request was sent to us while
+                # source was finishing off.
                 return False
             metadata['gc:migrating'] = "true"
             self.db.instance_metadata_update(context, instance_id, metadata, True)
+            self.outgoing_migration[instance_id] = True
         finally:
             self.cond.release()
         return True
@@ -197,6 +211,8 @@ class GridCentricManager(manager.SchedulerDependentManager):
             if 'gc:migrating' in metadata:
                 del metadata['gc:migrating']
             self.db.instance_metadata_update(context, instance_id, metadata, True)
+            if instance_id in self.outgoing_migration:
+                del self.outgoing_migration[instance_id]
         finally:
             self.cond.release()
 
@@ -437,6 +453,7 @@ class GridCentricManager(manager.SchedulerDependentManager):
         instance_ref = self.db.instance_get(context, instance_id)
 
         if migration_url:
+            self.incoming_migration[instance_id] = True
             # Just launch the given blessed instance.
             source_instance_ref = instance_ref
 
@@ -552,3 +569,65 @@ class GridCentricManager(manager.SchedulerDependentManager):
                                   vm_state=vm_states.ERROR, task_state=None)
             # Raise the error up.
             raise e
+
+
+    def _check_migration_status(self, context):
+        filter = {
+            'vm_state':vm_states.MIGRATNG,
+            'host': self.host,
+            'deleted':False
+        }
+        migrating_instances = self.compute_api.get_all(context, filter)
+        for instance in migrating_instance:
+            if instance['id'] not in self.outgoing_migration:
+                # Possible issues:
+                #   1) Everything in fine and this check occurs just before doing
+                #      the migration lock.
+                #   2) The service never received the migrate message.
+                #   3) The service was restarted in the middle of a migration
+                #   4) This service is now the destination host and the source
+                #      is finishing up.
+                #
+                # For the 1 & 2 case we will simply switch the status back to ACTIVE
+                # and have the user re-issue the migration. The 3 case is an error
+                # condition and for case 4 we want to wait for the source to finish up.
+                metadata = self.db.instance_metadata_get(context, instance['id'])
+                if 'gc:migrating' not in metadata:
+                    # This is either a case 1 or 2. In both cases we'll switch the
+                    # instance's state to ACTIVE.
+                    LOG.debug(_("Instance %s is in migrating state but no active migration is happening."), 
+                              instance['id'])
+                    self._instance_update(context, instance_ref['id'], vm_state=vm_states.ACTIVE)
+                elif instance['id'] not in self.incoming_migration:
+                    # This is case 3. The instance is not an incoming migration so
+                    # mark it as error because we don't really know what state it
+                    # is in.
+                    LOG.debug(_("Instance %s had an issue during migration. WIll mark as ERROR."), instance['id'])
+                    self._instance_update(context, instance_ref['id'], vm_state=vm_states.ERROR)
+                # Otherwise we will ignore it.
+
+    def _check_incoming_migration_status(self, context):
+        filter = {
+            'host':self.host,
+            'deleted':False
+        }
+        instances = self.compute_api.get_all(context, filter)
+        for instance in instances:
+            if instance['id'] in self.incoming_migration and instance['vm_state'] != vm_states.MIGRATING:
+                LOG.debug(_("Instance %s incoming migration has finished"), instance['id'])
+                # The incoming migration has finished
+                del self.incoming_migration[instance['id']] 
+
+    def periodic_tasks(self, context=None):
+        """Pass data back to the scheduler at a periodic interval."""
+        super(GridCentricManager, self).periodic_tasks(context)
+        # Do a simple check on migrations and ensure that we are aware
+        # of the migrations going on.
+        self.cond.acquire()
+        try:
+            self._check_migration_status(context)
+            self._check_incoming_migration_status(context)
+
+             
+        finally:
+            self.cond.release()
