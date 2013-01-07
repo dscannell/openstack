@@ -113,6 +113,12 @@ class GridcentricServerControllerExtension(wsgi.Controller):
         context = req.environ["nova.context"]
         return self._build_instance_list(req, self.gridcentric_api.list_blessed_instances(context, id))
 
+    @wsgi.action('gc_export')
+    @convert_exception
+    def _export_blessed_instance(self, req, id, body):
+        context = req.environ["nova.context"]
+        return self.gridcentric_api.export_blessed_instance(context, id)
+
     def _build_instance_list(self, req, instances):
         def _build_view(req, instance, is_detail=True):
             project_id = getattr(req.environ['nova.context'], 'project_id', '')
@@ -164,6 +170,27 @@ class GridcentricTargetBootController(object):
     def create(self, req, body):
         return self.nova_servers.create(req, body)
 
+class GridcentricImportController(wsgi.Controller):
+
+    _view_builder_class = views_servers.ViewBuilder
+
+    def __init__(self):
+        super(GridcentricImportController, self).__init__()
+        self.gridcentric_api = API()
+
+    @convert_exception
+    def create(self, req, body):
+        context= req.environ["nova.context"]
+
+        instance_data = body.get('instance_data', {})
+        image_id = body.get('image_id', None)
+        security_groups = body.get('secgroups', "default").split(',')
+        name = body.get('name', None)
+
+        instance =  self.gridcentric_api.import_blessed_instance(context, instance_data, name, security_groups, image_id)
+        view = self._view_builder.create(req, instance)
+        return wsgi.ResponseObject(view)
+
 class Gridcentric_extension(object):
     """ 
     The OpenStack Extension definition for the Gridcentric capabilities. Currently this includes:
@@ -192,6 +219,7 @@ class Gridcentric_extension(object):
         resource = extensions.ResourceExtension('gcservers',
                                                GridcentricTargetBootController())
         resources.append(resource)
+        resources.append(extensions.ResourceExtension('gc-import-server', GridcentricImportController()))
         return resources
 
     def get_controller_extensions(self):

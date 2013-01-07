@@ -29,6 +29,8 @@ from nova import rpc
 from nova.openstack.common import cfg
 from nova import utils
 
+from gridcentric.nova import image
+
 
 LOG = logging.getLogger('nova.gridcentric.api')
 FLAGS = flags.FLAGS
@@ -42,9 +44,10 @@ FLAGS.register_opts(gridcentric_api_opts)
 class API(base.Base):
     """API for interacting with the gridcentric manager."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, image_service=None, **kwargs):
         super(API, self).__init__(**kwargs)
         self.compute_api = compute.API()
+        self.image_service = image.ImageService()
 
     def get(self, context, instance_uuid):
         """Get a single instance with the given instance_uuid."""
@@ -327,6 +330,167 @@ class API(base.Base):
                   }
         blessed_instances = self.compute_api.get_all(context, filter)
         return blessed_instances
+
+    def export_blessed_instance(self, context, instance_uuid):
+        """
+        Exports the blessed instance in a format that can be imported.
+        This is useful for moving a blessed instance between clouds.
+        """
+        # Ensure that the instance_uuid is blessed
+        instance = self.get(context, instance_uuid)
+        if not(self._is_instance_blessed(context, instance_uuid)):
+            # The instance is not blessed. We can't launch new instances from it.
+            raise exception.Error(
+                _(("Instance %s is not blessed. " +
+                   "Only blessed instances can be exported.") % instance_uuid))
+
+        # Create an image record to store the blessed artifacts for this instance
+        # and call to nova-gc to populate the record
+
+        # Create the image in the image_service.
+        image_name = "%s%s" % ("export of ", instance['display_name'])
+        image_id = self.image_service.create(context, image_name)
+
+        self._cast_gridcentric_message("export_instance",context, instance_uuid, params={'image_id': image_id})
+
+        # sanitize the instance record to keep the important bits and pass it back,
+        # along with the image record.
+        #
+        # The sanitized instance data will look like:
+        #   need to keep instance.metadata
+        #   instance.security_groups --> We should also list the values in each security group
+        #
+        instance_data = self.create_instance_data(instance)
+
+        return {'instance_data': instance_data,
+               'image_id': image_id}
+
+    def rules_to_dict(self, rules):
+        return [{'from_port':rule['from_port'],
+                 'to_port':rule['to_port'],
+                 'protocol':rule['protocol'],
+                 'cidr':rule['cidr']} for rule in rules]
+
+    def create_instance_data(self, instance):
+        instance_metadata = {}
+        for entry in instance['metadata']:
+            instance_metadata[entry.key] = entry.value
+
+        """
+        instance_security_groups = []
+        for security_group in instance['security_groups']:
+            instance_security_groups.append({
+                'name': security_group['name'],
+                'description': security_group['description'],
+                'rules': self.rules_to_dict(security_group['rules'])
+            })
+        """
+
+        instance_data = {
+            'image_ref': instance['image_ref'],
+            'vm_state': instance['vm_state'],
+            'instance_type_id': instance['instance_type_id'],
+            'memory_mb': instance['memory_mb'],
+            'vcpus': instance['vcpus'],
+            'root_gb': instance['root_gb'],
+            'ephemeral_gb': instance['ephemeral_gb'],
+            'display_name': instance['display_name'],
+            'display_description': instance['display_description'],
+            'user_data': instance.get('user_data', ''),
+            'key_name': instance.get('key_name', ''),
+            'key_data': instance.get('key_data', ''),
+            'locked': False,
+            'metadata': instance_metadata,
+            'availability_zone': instance['availability_zone'],
+            'os_type': instance['os_type']
+            # 'security_groups': instance_security_groups
+        }
+
+        return instance_data
+
+    def apply_imported_security_group(self, context, instance_ref, security):
+        """
+        Applies the security groups to the imported instance_ref.
+        """
+
+        def are_same_rules(rules1, rules2):
+            # note(dscannell): This assumes that all of the rules in a set are unique
+            return len(rules1) == len(rules2) and \
+                False not in [rule in rules2 for rule in rules1]
+
+        def create_security_group_name(context, starting_name):
+            new_name = starting_name
+            i = 1
+            while self.db.security_group_exists(context, context.project_id, new_name):
+                new_name = "%s-%s" %(starting_name, str(i))
+
+            return new_name
+
+        db_security_groups = self.db.security_group_get_all(context)
+        elevated_context = context.elevated()
+        for import_group in import_security_groups:
+            matching_group_found = False
+
+            for db_group in db_security_groups:
+                if are_same_rules(self.rules_to_dict(db_group['rules']), import_group['rules']):
+                    # Associate this security group to the instance.
+                    matching_group_found = True
+                    self.db.instance_add_security_group(elevated_context, instance_ref['uuid'], db_group['id'])
+                    break
+
+            if not matching_group_found:
+                # Create a new security group and associate it to the instance.
+                # Need to check if this name already exists A likely scenario is if the default security group
+                # between installations are different..
+
+                new_group_values = {'user': context.user_id,
+                                    'project': context.project_id,
+                                    'name': create_security_group_name(context, import_group['name']),
+                                    'description': import_group['description']}
+                db_group = self.db.security_group_create(context, new_group_values)
+                # Add the rules to this new security group
+                for rule in import_group['rules']:
+                    # Create new rules
+                    pass
+                pass
+
+
+
+    def import_blessed_instance(self, context, instance_data, name, security_groups, image_id):
+        """
+        Imports the instance as a new blessed instance.
+        """
+
+        # the instance_blob will contain the image record in glance as well
+        # as the instance meta-data generated with export. We will use the meta-data
+        # to create a new record, and then pass this instance, with the image ref
+        # to nova-gc to finish off.
+
+        # NOTE(dscannell) we need to do all the bless quota stuff around here because we are essentially creating
+        # a new blessed instance into the system.
+
+        # Return the new import
+        metadata = instance_data.pop('metadata', {})
+
+        if name is not None:
+            instance_data['display_name'] = name
+
+        instance_data['project_id'] = context.project_id
+        instance_data['user_id'] = context.user_id
+        new_instance_ref = self.db.instance_create(context, instance_data)
+        LOG.debug(_("Imported new instance %s" % (new_instance_ref)))
+        self._instance_metadata_update(context, new_instance_ref['uuid'], metadata)
+
+        # Apply the security groups
+        for group_name in security_groups:
+            secgroup = self.db.security_group_get_by_name(context, context.project_id, group_name)
+            self.db.instance_add_security_group(context.elevated(), new_instance_ref['uuid'], secgroup['id'])
+
+        self._cast_gridcentric_message('import_instance', context, new_instance_ref['uuid'], params={'image_id':image_id})
+
+        # Essentially we want to create a new instance from this blob
+        return self.get(context, new_instance_ref['uuid'])
+
 
     def _find_boot_host(self, context, metadata):
 

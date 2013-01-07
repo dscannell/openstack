@@ -33,6 +33,9 @@ from nova.virt import images
 from nova import log as logging
 from nova.compute import utils as compute_utils
 from nova.openstack.common import cfg
+
+from gridcentric.nova import image
+
 LOG = logging.getLogger('nova.gridcentric.vmsconn')
 FLAGS = flags.FLAGS
 
@@ -152,7 +155,7 @@ class VmsConnection:
                     os.unlink(blessed_file)
 
     @_log_call
-    def _upload_files(self, context, instance_ref, blessed_files):
+    def _upload_files(self, context, instance_ref, blessed_files, image_ids=None):
         """ Upload the bless files into nova's image service (e.g. glance). """
         raise Exception("Uploading files to the image service is not supported.")
 
@@ -253,6 +256,61 @@ class VmsConnection:
     def post_migration(self, context, instance_ref, network_info, migration_url):
         pass
 
+    def pre_export(self, context, instance_ref, image_refs=[]):
+        fd, temp_target = tempfile.mkstemp()
+        os.close(fd)
+        return temp_target, None
+
+
+    def export_instance(self, context, instance_ref, image_id, image_refs=[]):
+        archive, path = self.pre_export(context, instance_ref, image_refs)
+        LOG.debug("DRS DEBUG: archive=%s, instance_name=%s" %(archive, instance_ref['name']))
+        result = tpool.execute(commands.export,
+                                instance_ref['name'],
+                                archive,
+                                path=path)
+
+        self.post_export(context, instance_ref, archive, image_id)
+
+    def post_export(self, context, instance_ref, archive, image_id, path=None):
+        # Load the archive into glance
+        image_service = image.ImageService()
+        image_service.upload(context, image_id, archive)
+
+        os.unlink(archive)
+
+    def pre_import(self, context, instance_ref, image_id):
+        # WE need to download the image from the image service
+        # and pass back the location.
+        image_service = image.ImageService()
+
+        fd, archive = tempfile.mkstemp()
+        try:
+            os.close(fd)
+            image_service.download(context, image_id, archive)
+        except Exception, ex:
+
+            try:
+                os.unlink(archive)
+            except:
+                LOG.warn(_("Fail to remove the import archive %s. It may still be on the system."), archive)
+            raise ex
+
+        return archive
+
+    def import_instance(self, context, instance_ref, image_id):
+        archive = self.pre_import(context, instance_ref, image_id)
+        result = tpool.execute(commands._import,
+                               instance_ref['name'],
+                               archive)
+
+        self.post_import(context, instance_ref, image_id, archive)
+
+    def post_import(self, context, instance_ref, image_id, archive):
+
+        os.unlink(archive)
+        # If we are using the image service, we need to upload the artifacts.
+
 class DummyConnection(VmsConnection):
     def configure(self):
         select_hypervisor('dummy')
@@ -347,6 +405,7 @@ class LibvirtConnection(VmsConnection):
                 LOG.debug('Base path %s does not exist. It will be created now.', image_base_path)
                 mkdir_as(image_base_path, self.openstack_uid)
             image_service = nova.image.get_default_image_service()
+            image_service = image.ImageService()
             for image_ref in image_refs:
                 image = image_service.show(context, image_ref)
                 target = os.path.join(image_base_path, image['name'])
@@ -361,11 +420,7 @@ class LibvirtConnection(VmsConnection):
                     fd, temp_target = tempfile.mkstemp(dir=image_base_path)
                     try:
                         os.close(fd)
-                        images.fetch(context,
-                                     image_ref,
-                                     temp_target,
-                                     new_instance_ref['user_id'],
-                                     new_instance_ref['project_id'])
+                        image_service.download(context, image_ref, temp_target)
                         os.chown(temp_target, self.openstack_uid, self.openstack_gid)
                         os.chmod(temp_target, 0644)
                         os.rename(temp_target, target)
@@ -484,32 +539,16 @@ class LibvirtConnection(VmsConnection):
         image_id = recv_meta['id']
         return str(image_id)
 
-    def _upload_files(self, context, instance_ref, blessed_files):
-        image_service = nova.image.get_default_image_service()
+    def _upload_files(self, context, instance_ref, blessed_files, image_ids=None):
+        image_service = image.ImageService()
         blessed_image_refs = []
         for blessed_file in blessed_files:
 
             image_name = blessed_file.split("/")[-1]
-            image_ref = self._create_image(context, image_service, instance_ref, image_name)
-            blessed_image_refs.append(image_ref)
+            image_id = image_service.create(context, image_name, instance_uuid=instance_ref['uuid'])
+            blessed_image_refs.append(image_id)
 
-            # Send up the file data to the newly created image.
-            metadata = {'is_public': False,
-                        'status': 'active',
-                        'name': image_name,
-                        'properties': {
-                                       'image_state': 'available',
-                                       'owner_id': instance_ref['project_id']}
-                        }
-            metadata['disk_format'] = "raw"
-            metadata['container_format'] = "bare"
-
-            # Upload that image to the image service
-            with open(blessed_file) as image_file:
-                image_service.update(context,
-                                     image_ref,
-                                     metadata,
-                                     image_file)
+            image_service.upload(context, image_id, blessed_file)
 
         return blessed_image_refs
 

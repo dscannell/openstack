@@ -18,7 +18,9 @@ An extension module for novaclient that allows the `nova` application access to 
 API extensions.
 """
 
+import json
 import os
+import sys
 
 from novaclient import utils
 from novaclient.v1_1 import servers
@@ -133,6 +135,41 @@ def do_list_blessed(cs, args):
     """List instances blessed from this instance."""
     server = _find_server(cs, args.server)
     _print_list(cs.gridcentric.list_blessed(server))
+
+@utils.arg('server', metavar='<server>', help="ID or name of the blessed  instance")
+@utils.arg('--output', metavar='<output>', default=None, help="Name of a file to write the exported data to.")
+def do_gc_export(cs, args):
+    """Export a blessed instance"""
+    server = _find_server(cs, args.server)
+    export = server.export()
+    instance_data = export['instance_data']
+    image_id = export['image_id']
+
+    json_instance_data = json.dumps(instance_data)
+    if args.output is not None:
+        with file(args.output, 'w') as f:
+            f.write(json_instance_data)
+    else:
+        sys.stdout.write(json_instance_data)
+
+    print "Instance data is being exported to image %s" %(image_id)
+
+@utils.arg('server_data', metavar='<server-data>', help="A file containing the exported server data")
+@utils.arg('image_id', metavar='<image>', help="The exported image id (loaded into glance)")
+@utils.arg('--name', metavar='<name>', help="Name of the imported instance")
+@utils.arg('--security_groups', metavar='<security_groups>', help="A common separated list of security groups")
+def do_gc_import(cs, args):
+    """Import a blessed instance"""
+    # Read in the contents of the server data (should be a json file)
+    instance_data = []
+    if args.server_data == '-':
+        # Read from sys.stdin
+        instance_json = sys.stdin
+    else:
+        instance_json = open(args.server_data)
+
+    server = cs.gridcentric.import_instance(json.load(instance_json), args.image_id, args.security_groups, args.name)
+    _print_server(cs, server)
 
 @utils.arg('--flavor',
      default=None,
@@ -290,6 +327,9 @@ class GcServer(servers.Server):
     def list_blessed(self):
         return self.manager.list_blessed(self)
 
+    def export(self):
+        return self.manager.export(self)
+
     def install_agent(self, user, key_path, location=None, version=None):
         self.manager.install_agent(self, user, key_path, location=location, version=version)
 
@@ -330,6 +370,23 @@ class GcServerManager(servers.ServerManager):
     def list_blessed(self, server):
         header, info = self._action("gc_list_blessed", server.id)
         return [self.get(server['id']) for server in info]
+
+    def export(self, server):
+        header, info = self._action("gc_export", server.id)
+        return info
+
+    def import_instance(self, instance_data, image_id, security_groups = None, name = None):
+        # Need to call the approperiate resource
+        url = "/gc-import-server"
+        body = {'instance_data': instance_data,
+                'image_id': image_id}
+
+        if security_groups is not None:
+            body['security_groups'] = security_groups
+        if name is not None:
+            body['name'] = name
+
+        return self._create(url, body, 'server')
 
     def create(self, name, image, flavor, meta=None, files=None,
                reservation_id=None, min_count=None,

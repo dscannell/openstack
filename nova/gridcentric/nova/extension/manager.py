@@ -787,3 +787,23 @@ class GridCentricManager(manager.SchedulerDependentManager):
             # is updated at some point with the correct state.
             _log_error("post launch update")
 
+    @_lock_call
+    def export_instance(self, context, instance_uuid=None, instance_ref=None, image_id=None):
+        """
+         Fills in the the image record with the blessed artifacts of the object
+        """
+
+        # Basically just make a call out to vmsconn (proper version, etc) to fill in the image
+        self.vms_conn.export_instance(context, instance_ref, image_id)
+
+    @_lock_call
+    def import_instance(self, context, instance_uuid=None, instance_ref=None, image_id=None):
+        """
+        Import the instance
+        """
+
+        # Download the image_id, load it into vmsconn (the archive). Vmsconn will spit out the blessed
+        # artifacts and we need to then upload them to the image service if that is what we are
+        # using.
+        self.vms_conn.import_instance(context, instance_ref, image_id)
+
