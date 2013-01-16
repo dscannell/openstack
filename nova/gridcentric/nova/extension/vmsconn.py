@@ -113,7 +113,59 @@ def _log_call(fn):
     wrapped_fn.__doc__ = fn.__doc__
     return wrapped_fn
 
+
+class VmsApi(object):
+
+    def bless(self, instance_name, new_instance_name, mem_url=None, migration=False):
+        return tpool.execute(commands.bless,
+                             instance_name,
+                             new_instance_name,
+                             mem_url=mem_url,
+                             migration=migration)
+
+    def discard(self, instance_name, mem_url=None):
+        return tpool.execute(commands.discard, instance_name, mem_url=mem_url)
+
+    def launch(self, instance_name, newname, params, path=None, mem_url=None, migration=False):
+
+        vmsargs = vmsrun.Arguments()
+        for key, value in params.get('guest', {}).iteritems():
+            vmsargs.add_param(key, value)
+
+        target = params.get('target', 0)
+        # Launch the new VM.
+        result = tpool.execute(commands.launch,
+            instance_name,
+            newname,
+            target,
+            path=path,
+            mem_url=mem_url,
+            migration=(mem_url and True),
+            vmsargs=vmsargs)
+
+    def export(self):
+        raise Exception("Export is an unsupported exception with this version of vms. Please upgrade.")
+
+    def _import(self, instance_name, archive):
+        raise Exception("Import is an unsupported operation with this version of vms. Please upgrade.")
+
+class VmsApi2_6(VmsApi):
+
+    def export(self, instance_name, archive, path=None):
+        result = tpool.execute(commands.export,
+            instance_name,
+            archive,
+            path=path)
+
+    def _import(self, instance_name, archive):
+        result = tpool.execute(commands._import, instance_name, archive)
+
+
 class VmsConnection:
+
+    def __init__(self, vms_api):
+        self.vms_api = vms_api
+
     def configure(self):
         """
         Configures vms for this type of connection.
@@ -127,11 +179,9 @@ class VmsConnection:
         instance the name new_instance_name.
         """
         new_instance_name = new_instance_ref['name']
-        (newname, network, blessed_files) = tpool.execute(commands.bless,
-                               instance_name,
-                               new_instance_name,
-                               mem_url=migration_url,
-                               migration=(migration_url and True))
+        (newname, network, blessed_files) = \
+                self.vms_api.bless(instance_name, new_instance_name,
+                                    mem_url = migration_url, migration=(migration_url and True))
         self._chmod_blessed_files(blessed_files)
 
         return (newname, network, blessed_files)
@@ -164,7 +214,7 @@ class VmsConnection:
         """
         Discard all of the vms artifacts associated with a blessed instance
         """
-        result = tpool.execute(commands.discard, instance_name, mem_url=migration_url)
+        result = self.vms_api.discard(instance_name, mem_url=migration_url)
         if FLAGS.gridcentric_use_image_service:
             self._delete_images(context, image_refs)
 
@@ -196,20 +246,8 @@ class VmsConnection:
                                         migration=(migration_url and True),
                                         skip_image_service=skip_image_service,
                                         image_refs=image_refs)
-
-        vmsargs = vmsrun.Arguments()
-        for key, value in params.get('guest', {}).iteritems():
-            vmsargs.add_param(key, value)
-
-        # Launch the new VM.
-        result = tpool.execute(commands.launch,
-                               instance_name,
-                               newname,
-                               target,
-                               path=path,
-                               mem_url=migration_url,
-                               migration=(migration_url and True),
-                               vmsargs=vmsargs)
+        result = self.vms_api.launch(instance_name, newname, params, path=path,
+                                    mem_url=migration_url, migration=(migration_url and True))
 
         # Take care of post-launch.
         self.post_launch(context,
@@ -265,10 +303,7 @@ class VmsConnection:
     def export_instance(self, context, instance_ref, image_id, image_refs=[]):
         archive, path = self.pre_export(context, instance_ref, image_refs)
         LOG.debug("DRS DEBUG: archive=%s, instance_name=%s" %(archive, instance_ref['name']))
-        result = tpool.execute(commands.export,
-                                instance_ref['name'],
-                                archive,
-                                path=path)
+        result = self.vms_api.export(instance_ref['name'], archive, path=path)
 
         self.post_export(context, instance_ref, archive, image_id)
 
@@ -300,9 +335,7 @@ class VmsConnection:
 
     def import_instance(self, context, instance_ref, image_id):
         archive = self.pre_import(context, instance_ref, image_id)
-        result = tpool.execute(commands._import,
-                               instance_ref['name'],
-                               archive)
+        result = self.vms_api.import_instance(instance_ref['name'], archive)
 
         self.post_import(context, instance_ref, image_id, archive)
 
